@@ -6,7 +6,7 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-multipart==0.0.6
 mysql-connector-python==8.2.0
-python-dotenv==1.0.0
+python-dotenv==1.2.2
 redis==5.0.1
 paho-mqtt==1.6.1
 sqlalchemy==2.0.25
