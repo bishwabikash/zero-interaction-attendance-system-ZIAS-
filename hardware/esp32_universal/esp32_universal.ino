@@ -97,7 +97,17 @@ void setup() {
 
     prefs.begin("zias", false);
 
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    {
+        esp_task_wdt_config_t wdt_cfg = {};
+        wdt_cfg.timeout_ms = (uint32_t) WDT_TIMEOUT_SECONDS * 1000U;
+        wdt_cfg.idle_core_mask = 0;
+        wdt_cfg.trigger_panic = true;
+        esp_task_wdt_reconfigure(&wdt_cfg);
+    }
+#else
     esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+#endif
     esp_task_wdt_add(NULL);
 
     detectHardware();
@@ -320,18 +330,24 @@ static void setupBLEBeacon() {
 #endif
 }
 
+static inline String qKey(const char *prefix, uint32_t idx) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%s%u", prefix, (unsigned) idx);
+    return String(buf);
+}
+
 static void queueOffline(const String &topic, const String &payload) {
     uint32_t count = prefs.getUInt("q_count", 0);
     if (count >= OFFLINE_QUEUE_MAX) {
         Serial.println("[queue] full, dropping oldest");
         for (uint32_t i = 1; i < count; i++) {
-            prefs.putString((String("q_t") + i - 1).c_str(), prefs.getString((String("q_t") + i).c_str()));
-            prefs.putString((String("q_p") + i - 1).c_str(), prefs.getString((String("q_p") + i).c_str()));
+            prefs.putString(qKey("q_t", i - 1).c_str(), prefs.getString(qKey("q_t", i).c_str()));
+            prefs.putString(qKey("q_p", i - 1).c_str(), prefs.getString(qKey("q_p", i).c_str()));
         }
         count = OFFLINE_QUEUE_MAX - 1;
     }
-    prefs.putString((String("q_t") + count).c_str(), topic);
-    prefs.putString((String("q_p") + count).c_str(), payload);
+    prefs.putString(qKey("q_t", count).c_str(), topic);
+    prefs.putString(qKey("q_p", count).c_str(), payload);
     prefs.putUInt("q_count", count + 1);
     Serial.printf("[queue] stored (%u total)\n", count + 1);
 }
@@ -341,16 +357,16 @@ static void drainOfflineQueue() {
     if (!count) return;
     Serial.printf("[queue] draining %u events\n", count);
     for (uint32_t i = 0; i < count; i++) {
-        String topic = prefs.getString((String("q_t") + i).c_str());
-        String payload = prefs.getString((String("q_p") + i).c_str());
+        String topic = prefs.getString(qKey("q_t", i).c_str());
+        String payload = prefs.getString(qKey("q_p", i).c_str());
         if (topic.length() && !mqttClient.publish(topic.c_str(), payload.c_str())) {
             Serial.println("[queue] resend failed; aborting drain");
             return;
         }
     }
     for (uint32_t i = 0; i < count; i++) {
-        prefs.remove((String("q_t") + i).c_str());
-        prefs.remove((String("q_p") + i).c_str());
+        prefs.remove(qKey("q_t", i).c_str());
+        prefs.remove(qKey("q_p", i).c_str());
     }
     prefs.putUInt("q_count", 0);
 }
