@@ -1,0 +1,19 @@
+[Unit]
+Description=ZIAS attendance stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/zias
+EnvironmentFile=/opt/zias/.env
+ExecStartPre=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.rpi.yml pull
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.rpi.yml up -d --remove-orphans
+ExecStart=/usr/bin/docker compose exec -T api python -m scripts.seed_admin
+ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.rpi.yml down
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

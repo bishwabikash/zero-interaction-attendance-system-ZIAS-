@@ -1,196 +1,214 @@
-"""
-Event Processor - Processes MQTT events and updates database
-Runs as separate process/container
-"""
+"""Event processor: turns raw sensor/BLE events into attendance records."""
 
 import asyncio
 import json
+import signal
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
+
 import redis.asyncio as redis
-from datetime import datetime, timedelta
-from sqlalchemy.orm import Session
 
 from api.config import settings
 from api.database import get_db_session
-from api.db_models import SensorData, EntryLog, BLEEvent, Student, UserDevice
+from api.db_models import (
+    BLEEvent,
+    DeviceStatusEnum,
+    DirectionEnum,
+    EntryLog,
+    SensorData,
+    Student,
+    UserDevice,
+)
+
+
+def _parse_ts(value: Optional[str]) -> datetime:
+    if not value:
+        return datetime.utcnow()
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.utcnow()
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
 class EventProcessor:
-    """Process sensor and BLE events from Redis"""
-    
-    def __init__(self):
-        self.redis_client = None
+    def __init__(self) -> None:
+        self.redis_client: Optional[redis.Redis] = None
         self.pubsub = None
-        
-    async def start(self):
-        """Start event processor"""
-        print("Starting event processor...")
-        
-        # Connect to Redis
+        self._stop = asyncio.Event()
+
+    async def start(self) -> None:
         self.redis_client = redis.from_url(settings.REDIS_URL)
         self.pubsub = self.redis_client.pubsub()
-        
-        # Subscribe to event channel
-        await self.pubsub.subscribe('zias:events')
-        
-        print(f"Subscribed to Redis channel: zias:events")
-        print("Event processor ready!")
-        
-        # Process events
-        async for message in self.pubsub.listen():
-            if message['type'] == 'message':
-                await self.process_event(message['data'])
-    
-    async def process_event(self, data: bytes):
-        """Process individual event"""
+        await self.pubsub.subscribe("zias:events")
+        print("[proc] subscribed to zias:events")
+
         try:
-            event = json.loads(data.decode())
-            event_type = event.get('type')
-            
-            if event_type == 'sensor':
-                await self.process_sensor_event(event)
-            elif event_type == 'ble':
-                await self.process_ble_event(event)
-            else:
-                print(f"Unknown event type: {event_type}")
-                
-        except Exception as e:
-            print(f"Error processing event: {e}")
-    
-    async def process_sensor_event(self, event: dict):
-        """Process RFID/PIR sensor event"""
-        print(f"Processing sensor event: {event}")
-        
+            async for message in self.pubsub.listen():
+                if self._stop.is_set():
+                    break
+                if message.get("type") == "message":
+                    await self._safe_process(message["data"])
+        finally:
+            await self.stop()
+
+    async def _safe_process(self, data) -> None:
+        try:
+            event = json.loads(data.decode() if isinstance(data, bytes) else data)
+            kind = event.get("type")
+            if kind == "sensor":
+                await self._process_sensor(event)
+            elif kind == "ble":
+                await self._process_ble(event)
+            elif kind == "status":
+                await self._process_status(event)
+        except Exception as exc:
+            print(f"[proc] error: {exc}")
+
+    async def _process_sensor(self, event: Dict[str, Any]) -> None:
+        device_id = event.get("device_id")
+        rfid = event.get("rfid")
+        cluster_id = event.get("cluster_id")
+        received_at = _parse_ts(event.get("received_at"))
+
         with get_db_session() as db:
-            # Store raw sensor data
-            sensor_data = SensorData(
-                device_ID=event.get('device_id'),
-                cluster_ID=event.get('cluster_id'),
-                RFID=event.get('rfid'),
-                sensor_active=event.get('sensor_active', True),
-                time_stamp=datetime.fromisoformat(event.get('timestamp'))
-            )
-            db.add(sensor_data)
-            
-            # Check for matching entry/exit pair
-            if event.get('rfid'):
-                await self.check_entry_exit_match(db, event)
-            
-            db.commit()
-    
-    async def check_entry_exit_match(self, db: Session, event: dict):
-        """
-        Check if this event matches with a recent event from different device
-        to determine entry vs exit
-        """
-        rfid = event.get('rfid')
-        cluster_id = event.get('cluster_id')
-        device_id = event.get('device_id')
-        
-        # Get recent events from same cluster but different device
-        window_start = datetime.utcnow() - timedelta(seconds=settings.ATTENDANCE_WINDOW_SECONDS)
-        
-        recent_events = db.query(SensorData).filter(
-            SensorData.cluster_ID == cluster_id,
-            SensorData.RFID == rfid,
-            SensorData.device_ID != device_id,
-            SensorData.time_stamp >= window_start,
-            SensorData.processed == False
-        ).all()
-        
-        if recent_events:
-            # Found matching event - determine entry vs exit
-            # Device ID ending in even number = entry, odd = exit
-            is_entry = int(device_id[-1]) % 2 == 0 if device_id[-1].isdigit() else True
-            
-            # Create entry log
-            status = 1 if is_entry else -1
-            
-            # Get student name
-            student = db.query(Student).filter(Student.RFID == rfid).first()
-            student_name = student.stud_name if student else "Unknown"
-            
-            # Get room value
             device = db.query(UserDevice).filter(UserDevice.device_id == device_id).first()
-            room = device.room_value if device else f"cluster_{cluster_id}"
-            
-            entry_log = EntryLog(
-                student_name=student_name,
+            if not device:
+                print(f"[proc] unknown device {device_id} — skipping")
+                return
+
+            db.add(
+                SensorData(
+                    device_ID=device_id,
+                    cluster_ID=cluster_id if cluster_id is not None else device.cluster_ID,
+                    RFID=rfid,
+                    time_stamp=received_at,
+                    sensor_active=bool(event.get("sensor_active", True)),
+                    processed=bool(rfid),
+                )
+            )
+
+            if not rfid:
+                db.commit()
+                return
+
+            if self._is_tailgate(db, rfid, device.room_value, received_at):
+                db.commit()
+                return
+
+            student = db.query(Student).filter(Student.RFID == rfid).first()
+            status_int = self._infer_direction(device)
+
+            log = EntryLog(
+                student_id=student.student_id if student else None,
+                student_name=student.stud_name if student else "Unknown",
                 RFID=rfid,
-                room_value=room,
-                status=status,
+                room_value=device.room_value,
+                status=status_int,
+                timestamp=received_at,
                 confidence=0.95,
-                source="rfid"
+                source="rfid",
             )
-            db.add(entry_log)
-            
-            # Mark events as processed
-            for event in recent_events:
-                event.processed = True
-            
-            print(f"Logged {'entry' if is_entry else 'exit'} for {student_name}")
-    
-    async def process_ble_event(self, event: dict):
-        """Process BLE beacon event from mobile app"""
-        print(f"Processing BLE event: {event}")
-        
-        with get_db_session() as db:
-            # Store BLE event
-            ble_event = BLEEvent(
-                student_id=event.get('student_id'),
-                beacon_uuid=event.get('beacon_uuid'),
-                rssi=event.get('rssi'),
-                latitude=event.get('location', {}).get('latitude'),
-                longitude=event.get('location', {}).get('longitude'),
-                event_type=event.get('event_type', 'unknown'),
-                app_version=event.get('app_version', ''),
-                timestamp=datetime.fromisoformat(event.get('timestamp'))
-            )
-            db.add(ble_event)
-            
-            # If entry/exit event, create attendance log
-            if event.get('event_type') in ['entry', 'exit']:
-                status = 1 if event.get('event_type') == 'entry' else -1
-                
-                student = db.query(Student).filter(Student.student_id == event.get('student_id')).first()
-                
-                if student:
-                    # Extract room from beacon UUID (e.g., "zias-main-101-entry")
-                    beacon_parts = event.get('beacon_uuid', '').split('-')
-                    room = beacon_parts[2] if len(beacon_parts) > 2 else "unknown"
-                    
-                    entry_log = EntryLog(
-                        student_name=student.stud_name,
-                        RFID=student.RFID or '',
-                        room_value=room,
-                        status=status,
-                        confidence=0.85,  # BLE slightly lower confidence than RFID
-                        source="ble"
-                    )
-                    db.add(entry_log)
-                    
-                    print(f"Logged BLE {event.get('event_type')} for {student.stud_name}")
-            
+            db.add(log)
             db.commit()
-    
-    async def stop(self):
-        """Stop event processor"""
+            direction_label = "entry" if status_int == 1 else "exit"
+            print(f"[proc] logged {direction_label} for {log.student_name} @ {device.room_value}")
+
+    @staticmethod
+    def _infer_direction(device: UserDevice) -> int:
+        if device.direction == DirectionEnum.EXIT:
+            return -1
+        return 1
+
+    @staticmethod
+    def _is_tailgate(db, rfid: str, room: str, now: datetime) -> bool:
+        cutoff = now - timedelta(seconds=settings.ANTI_TAILGATING_DELAY_SECONDS)
+        recent = (
+            db.query(EntryLog)
+            .filter(
+                EntryLog.RFID == rfid,
+                EntryLog.room_value == room,
+                EntryLog.timestamp >= cutoff,
+            )
+            .first()
+        )
+        if recent:
+            print(f"[proc] tailgate suppressed for {rfid} @ {room}")
+            return True
+        return False
+
+    async def _process_ble(self, event: Dict[str, Any]) -> None:
+        with get_db_session() as db:
+            db.add(
+                BLEEvent(
+                    student_id=event.get("student_id"),
+                    beacon_uuid=event.get("beacon_uuid") or "",
+                    rssi=event.get("rssi"),
+                    latitude=(event.get("location") or {}).get("latitude"),
+                    longitude=(event.get("location") or {}).get("longitude"),
+                    event_type=event.get("event_type", "approaching"),
+                    app_version=event.get("app_version", ""),
+                    timestamp=_parse_ts(event.get("received_at")),
+                )
+            )
+
+            if event.get("event_type") in ("entry", "exit"):
+                student = db.query(Student).filter(Student.student_id == event.get("student_id")).first()
+                if student:
+                    parts = (event.get("beacon_uuid") or "").split("-")
+                    room = parts[2] if len(parts) > 2 else "unknown"
+                    status_int = 1 if event["event_type"] == "entry" else -1
+                    db.add(
+                        EntryLog(
+                            student_id=student.student_id,
+                            student_name=student.stud_name,
+                            RFID=student.RFID,
+                            room_value=room,
+                            status=status_int,
+                            timestamp=_parse_ts(event.get("received_at")),
+                            confidence=0.85,
+                            source="ble",
+                        )
+                    )
+            db.commit()
+
+    async def _process_status(self, event: Dict[str, Any]) -> None:
+        with get_db_session() as db:
+            device = db.query(UserDevice).filter(UserDevice.device_id == event.get("device_id")).first()
+            if not device:
+                return
+            device.last_seen = _parse_ts(event.get("received_at"))
+            device.has_rfid = bool(event.get("has_rfid"))
+            device.has_pir = bool(event.get("has_pir"))
+            device.has_ble = bool(event.get("has_ble"))
+            device.has_camera = bool(event.get("has_camera"))
+            device.ip_address = event.get("ip")
+            device.firmware_version = event.get("firmware_version")
+            device.status = DeviceStatusEnum.ACTIVE
+            db.commit()
+
+    async def stop(self) -> None:
+        self._stop.set()
         if self.pubsub:
-            await self.pubsub.unsubscribe('zias:events')
+            try:
+                await self.pubsub.unsubscribe("zias:events")
+                await self.pubsub.close()
+            except Exception:
+                pass
         if self.redis_client:
             await self.redis_client.close()
-        print("Event processor stopped")
 
 
-async def main():
-    """Main entry point"""
-    processor = EventProcessor()
-    
-    try:
-        await processor.start()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-        await processor.stop()
+async def _main() -> None:
+    proc = EventProcessor()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(proc.stop()))
+        except NotImplementedError:
+            pass
+    await proc.start()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_main())
