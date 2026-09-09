@@ -3,8 +3,7 @@
 from typing import List
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict, NoDecode
-from typing_extensions import Annotated
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -41,12 +40,9 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 1440
 
-    # CORS — accept CSV via env; convert in validator below.
-    CORS_ORIGINS: Annotated[List[str], NoDecode] = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:8080",
-    ]
+    # CORS — accept a comma-separated string in env (works on every
+    # pydantic-settings 2.x line; 2.2 has no NoDecode helper).
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173,http://localhost:8080"
 
     # Attendance behavior
     ATTENDANCE_WINDOW_SECONDS: int = 10
@@ -61,16 +57,13 @@ class Settings(BaseSettings):
     BOOTSTRAP_ADMIN_PASSWORD: str = ""
 
     @property
+    def cors_origins_list(self) -> List[str]:
+        return [item.strip() for item in self.CORS_ORIGINS.split(",") if item.strip()]
+
+    @property
     def REDIS_URL(self) -> str:
         auth = f":{self.REDIS_PASSWORD}@" if self.REDIS_PASSWORD else ""
         return f"redis://{auth}{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
-
-    @field_validator("CORS_ORIGINS", mode="before")
-    @classmethod
-    def _split_cors(cls, value):
-        if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
-        return value
 
     @field_validator("JWT_SECRET_KEY")
     @classmethod

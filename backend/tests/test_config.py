@@ -2,7 +2,7 @@ from api.config import settings
 
 
 def test_cors_origins_parsed_from_csv():
-    assert settings.CORS_ORIGINS == ["http://a", "http://b"]
+    assert settings.cors_origins_list == ["http://a", "http://b"]
 
 
 def test_redis_url_format():
