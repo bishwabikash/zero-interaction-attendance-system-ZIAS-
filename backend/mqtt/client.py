@@ -1,171 +1,188 @@
-"""
-MQTT Client for handling IoT device events
-Publishes to Redis and processes attendance logic
-"""
+"""MQTT client bridging ESP32 nodes → Redis events."""
+
+import asyncio
+import json
+import threading
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import paho.mqtt.client as mqtt
-import json
-import asyncio
-from datetime import datetime
-from typing import Dict, Any
 import redis.asyncio as redis
 
 from api.config import settings
-from api.models import AttendanceEvent, DeviceType
 
 
 class MQTTClient:
-    """MQTT client for device communication"""
-    
-    def __init__(self):
-        self.client = mqtt.Client()
-        self.client.on_connect = self.on_connect
-        self.client.on_message = self.on_message
-        self.client.on_disconnect = self.on_disconnect
-        
-        self.redis_client = None
-        self.connected = False
-        
-        if settings.MQTT_USERNAME:
-            self.client.username_pw_set(
-                settings.MQTT_USERNAME,
-                settings.MQTT_PASSWORD
-            )
-    
-    def on_connect(self, client, userdata, flags, rc):
-        """Callback when connected to MQTT broker"""
-        if rc == 0:
-            print(f"Connected to MQTT broker at {settings.MQTT_BROKER}")
-            self.connected = True
-            
-            # Subscribe to all device topics
-            topics = [
-                f"{settings.MQTT_TOPIC_PREFIX}/devices/+/sensor",  # RFID/PIR events
-                f"{settings.MQTT_TOPIC_PREFIX}/mobile/+/beacon",   # BLE events
-                f"{settings.MQTT_TOPIC_PREFIX}/devices/+/status",  # Device status
-            ]
-            
-            for topic in topics:
-                client.subscribe(topic)
-                print(f"Subscribed to: {topic}")
-        else:
-            print(f"Failed to connect to MQTT broker, code: {rc}")
-            self.connected = False
-    
-    def on_disconnect(self, client, userdata, rc):
-        """Callback when disconnected"""
-        print(f"Disconnected from MQTT broker, code: {rc}")
-        self.connected = False
-    
-    def on_message(self, client, userdata, msg):
-        """Callback when message received"""
+    """Paho MQTT client whose sync callbacks marshal work to an asyncio loop."""
+
+    def __init__(self) -> None:
         try:
-            payload = json.loads(msg.payload.decode())
-            topic_parts = msg.topic.split('/')
-            
-            if 'sensor' in msg.topic:
-                # RFID/PIR sensor event
-                self.handle_sensor_event(topic_parts[2], payload)
-            elif 'beacon' in msg.topic:
-                # BLE beacon event from mobile app
-                self.handle_beacon_event(topic_parts[2], payload)
-            elif 'status' in msg.topic:
-                # Device status update
-                self.handle_device_status(topic_parts[2], payload)
-                
-        except json.JSONDecodeError as e:
-            print(f"Invalid JSON in MQTT message: {e}")
-        except Exception as e:
-            print(f"Error processing MQTT message: {e}")
-    
-    def handle_sensor_event(self, device_id: str, payload: Dict[str, Any]):
-        """Handle RFID/PIR sensor events"""
-        print(f"Sensor event from {device_id}: {payload}")
-        
-        # Publish to Redis for real-time processing
-        asyncio.create_task(self.publish_to_redis({
-            'type': 'sensor',
-            'device_id': device_id,
-            'rfid': payload.get('id'),
-            'cluster_id': payload.get('cluster_id'),
-            'sensor_active': payload.get('sensor', False),
-            'timestamp': datetime.utcnow().isoformat()
-        }))
-    
-    def handle_beacon_event(self, student_id: str, payload: Dict[str, Any]):
-        """Handle BLE beacon events from smartphone app"""
-        print(f"BLE beacon event from {student_id}: {payload}")
-        
-        asyncio.create_task(self.publish_to_redis({
-            'type': 'ble',
-            'student_id': student_id,
-            'beacon_uuid': payload.get('beacon_uuid'),
-            'rssi': payload.get('rssi'),
-            'location': payload.get('location'),
-            'timestamp': datetime.utcnow().isoformat()
-        }))
-    
-    def handle_device_status(self, device_id: str, payload: Dict[str, Any]):
-        """Handle device status updates"""
-        print(f"Device status from {device_id}: {payload}")
-        
-        # Update device last_seen in database
-        asyncio.create_task(self.update_device_status(device_id, payload))
-    
-    async def publish_to_redis(self, event: Dict[str, Any]):
-        """Publish event to Redis for processing"""
-        if not self.redis_client:
-            self.redis_client = redis.from_url(settings.REDIS_URL)
-        
-        # Publish to Redis channel for real-time processing
-        await self.redis_client.publish(
-            'zias:events',
-            json.dumps(event)
-        )
-        
-        # Also store in Redis with TTL for state tracking
-        key = f"zias:state:{event.get('device_id', event.get('student_id'))}"
-        await self.redis_client.setex(
-            key,
-            settings.ATTENDANCE_WINDOW_SECONDS,
-            json.dumps(event)
-        )
-    
-    async def update_device_status(self, device_id: str, status: Dict[str, Any]):
-        """Update device status in database"""
-        # TODO: Implement database update
-        pass
-    
-    def publish(self, topic: str, payload: Dict[str, Any]):
-        """Publish message to MQTT topic"""
+            self.client = mqtt.Client(
+                client_id=f"zias-backend-{datetime.utcnow().timestamp():.0f}",
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            )
+            self._paho_v2 = True
+        except (AttributeError, TypeError):
+            self.client = mqtt.Client(client_id=f"zias-backend-{datetime.utcnow().timestamp():.0f}")
+            self._paho_v2 = False
+
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+        self.client.on_disconnect = self._on_disconnect
+
+        if settings.MQTT_USERNAME:
+            self.client.username_pw_set(settings.MQTT_USERNAME, settings.MQTT_PASSWORD)
+
+        if getattr(settings, "MQTT_TLS", False):
+            self.client.tls_set()
+
+        self.connected = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
+        self._redis: Optional[redis.Redis] = None
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        rc = reason_code if isinstance(reason_code, int) else getattr(reason_code, "value", 0)
+        if rc == 0:
+            print(f"[mqtt] connected to {settings.MQTT_BROKER}:{settings.MQTT_PORT}")
+            self.connected = True
+            for topic in (
+                f"{settings.MQTT_TOPIC_PREFIX}/devices/+/sensor",
+                f"{settings.MQTT_TOPIC_PREFIX}/mobile/+/beacon",
+                f"{settings.MQTT_TOPIC_PREFIX}/devices/+/status",
+            ):
+                client.subscribe(topic, qos=1)
+                print(f"[mqtt] subscribed {topic}")
+        else:
+            print(f"[mqtt] connection failed rc={rc}")
+            self.connected = False
+
+    def _on_disconnect(self, *args, **_kwargs):
+        self.connected = False
+        print("[mqtt] disconnected; auto-reconnect active")
+
+    def _on_message(self, client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            print(f"[mqtt] bad payload on {msg.topic}: {exc}")
+            return
+
+        parts = msg.topic.split("/")
+        try:
+            device_or_user = parts[2]
+        except IndexError:
+            return
+
+        if msg.topic.endswith("/sensor"):
+            event = self._normalize_sensor(device_or_user, payload)
+        elif msg.topic.endswith("/beacon"):
+            event = self._normalize_beacon(device_or_user, payload)
+        elif msg.topic.endswith("/status"):
+            event = self._normalize_status(device_or_user, payload)
+        else:
+            return
+
+        self._schedule(self._publish_to_redis(event))
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _normalize_sensor(self, device_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": "sensor",
+            "device_id": device_id,
+            "cluster_id": payload.get("cluster_id"),
+            "rfid": payload.get("rfid") or payload.get("id"),
+            "event_type": payload.get("event_type", "activated"),
+            "sensor_active": bool(payload.get("sensor", True)),
+            "device_time_ms": payload.get("timestamp"),
+            "received_at": self._now_iso(),
+        }
+
+    def _normalize_beacon(self, student_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": "ble",
+            "student_id": student_id,
+            "beacon_uuid": payload.get("beacon_uuid"),
+            "rssi": payload.get("rssi"),
+            "event_type": payload.get("event_type", "approaching"),
+            "location": payload.get("location") or {},
+            "app_version": payload.get("app_version", ""),
+            "received_at": self._now_iso(),
+        }
+
+    def _normalize_status(self, device_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": "status",
+            "device_id": device_id,
+            "status": payload.get("status", "online"),
+            "has_rfid": bool(payload.get("has_rfid")),
+            "has_pir": bool(payload.get("has_pir")),
+            "has_ble": bool(payload.get("has_ble")),
+            "has_camera": bool(payload.get("has_camera")),
+            "ip": payload.get("ip"),
+            "rssi": payload.get("rssi"),
+            "firmware_version": payload.get("firmware_version"),
+            "received_at": self._now_iso(),
+        }
+
+    def _schedule(self, coro):
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro, self._loop)
+        else:
+            print("[mqtt] no asyncio loop, event dropped")
+
+    async def _publish_to_redis(self, event: Dict[str, Any]) -> None:
+        if self._redis is None:
+            self._redis = redis.from_url(settings.REDIS_URL)
+        payload = json.dumps(event, default=str)
+        try:
+            await self._redis.publish("zias:events", payload)
+            key = f"zias:state:{event.get('device_id') or event.get('student_id') or 'unknown'}"
+            await self._redis.setex(key, settings.ATTENDANCE_WINDOW_SECONDS, payload)
+        except Exception as exc:
+            print(f"[mqtt] redis publish failed: {exc}")
+
+    def _run_loop(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_forever()
+        finally:
+            self._loop.close()
+
+    def publish(self, topic: str, payload: Dict[str, Any], qos: int = 1) -> None:
         self.client.publish(
             f"{settings.MQTT_TOPIC_PREFIX}/{topic}",
-            json.dumps(payload)
+            json.dumps(payload, default=str),
+            qos=qos,
         )
-    
-    def start(self):
-        """Start MQTT client"""
+
+    def start(self) -> None:
+        if not self._loop_thread:
+            self._loop_thread = threading.Thread(target=self._run_loop, daemon=True, name="mqtt-loop")
+            self._loop_thread.start()
+
         try:
-            self.client.connect(
-                settings.MQTT_BROKER,
-                settings.MQTT_PORT,
-                keepalive=60
-            )
+            self.client.connect(settings.MQTT_BROKER, settings.MQTT_PORT, keepalive=30)
             self.client.loop_start()
-            print("MQTT client started")
-        except Exception as e:
-            print(f"Failed to start MQTT client: {e}")
-    
-    def stop(self):
-        """Stop MQTT client"""
-        self.client.loop_stop()
-        self.client.disconnect()
-        print("MQTT client stopped")
-    
+            print("[mqtt] client started")
+        except Exception as exc:
+            print(f"[mqtt] failed to start: {exc}")
+
+    def stop(self) -> None:
+        try:
+            self.client.loop_stop()
+            self.client.disconnect()
+        finally:
+            if self._loop and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._loop.stop)
+        print("[mqtt] client stopped")
+
     def is_connected(self) -> bool:
-        """Check if connected to broker"""
         return self.connected
 
 
-# Global MQTT client instance
 mqtt_client = MQTTClient()

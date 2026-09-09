@@ -1,71 +1,69 @@
-version: '3.8'
-
 services:
-  # MySQL Database
-  mysql:
-    image: mysql:8.0
-    container_name: zias_mysql
+  db:
+    image: mariadb:10.11
+    container_name: zias_db
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
-    ports:
-      - "3306:3306"
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
     volumes:
-      - mysql_data:/var/lib/mysql
-      - ./docs/database_schema.sql:/docker-entrypoint-initdb.d/schema.sql
-    networks:
-      - zias_network
+      - db_data:/var/lib/mysql
+      - ./docs/database_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    networks: [zias]
     healthcheck:
-      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost" ]
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
 
-  # Redis for state management
   redis:
     image: redis:7-alpine
     container_name: zias_redis
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
-    networks:
-      - zias_network
+    networks: [zias]
     healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
-  # Mosquitto MQTT Broker
   mosquitto:
     image: eclipse-mosquitto:2
     container_name: zias_mosquitto
+    restart: unless-stopped
     ports:
       - "1883:1883"
       - "9001:9001"
     volumes:
       - ./mosquitto/config:/mosquitto/config
-      - ./mosquitto/data:/mosquitto/data
-      - ./mosquitto/log:/mosquitto/log
-    networks:
-      - zias_network
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    networks: [zias]
     healthcheck:
-      test: [ "CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck", "-W", "3" ]
-      interval: 10s
+      test:
+        - CMD-SHELL
+        - "mosquitto_sub -h localhost -t '$$SYS/#' -C 1 -W 3 -u $$MQTT_HEALTH_USER -P $$MQTT_HEALTH_PASSWORD >/dev/null || exit 1"
+      interval: 15s
       timeout: 5s
       retries: 3
+    environment:
+      MQTT_HEALTH_USER: ${MQTT_BACKEND_USER:-zias-backend}
+      MQTT_HEALTH_PASSWORD: ${MQTT_BACKEND_PASSWORD}
 
-  # FastAPI Backend
   api:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: zias/api:latest
     container_name: zias_api
+    restart: unless-stopped
     environment:
-      DB_HOST: mysql
+      DB_HOST: db
       DB_PORT: 3306
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
@@ -74,68 +72,66 @@ services:
       REDIS_PORT: 6379
       MQTT_BROKER: mosquitto
       MQTT_PORT: 1883
+      MQTT_USERNAME: ${MQTT_BACKEND_USER:-zias-backend}
+      MQTT_PASSWORD: ${MQTT_BACKEND_PASSWORD}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,http://localhost:5173}
+      BOOTSTRAP_ADMIN_USER: ${BOOTSTRAP_ADMIN_USER:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD}
     ports:
       - "8000:8000"
     depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      mosquitto:
-        condition: service_healthy
-    networks:
-      - zias_network
-    volumes:
-      - ./backend:/app
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      mosquitto: {condition: service_started}
+    networks: [zias]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
-  # Event Processor (processes MQTT events)
   processor:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: zias/api:latest
     container_name: zias_processor
+    restart: unless-stopped
     environment:
-      DB_HOST: mysql
-      DB_PORT: 3306
+      DB_HOST: db
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
       DB_NAME: ${DB_NAME}
       REDIS_HOST: redis
-      REDIS_PORT: 6379
       MQTT_BROKER: mosquitto
-      MQTT_PORT: 1883
+      MQTT_USERNAME: ${MQTT_BACKEND_USER:-zias-backend}
+      MQTT_PASSWORD: ${MQTT_BACKEND_PASSWORD}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
     depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      mosquitto:
-        condition: service_healthy
-    networks:
-      - zias_network
-    volumes:
-      - ./backend:/app
-    command: python -m mqtt.event_processor
+      api: {condition: service_started}
+    networks: [zias]
+    command: ["python", "-m", "mqtt.event_processor"]
 
-  # Frontend (React + Nginx)
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-/}
     container_name: zias_frontend
+    restart: unless-stopped
     ports:
       - "80:80"
-    depends_on:
-      - api
-    networks:
-      - zias_network
+    depends_on: [api]
+    networks: [zias]
 
 networks:
-  zias_network:
+  zias:
     driver: bridge
 
 volumes:
-  mysql_data:
+  db_data:
   redis_data:
+  mosquitto_data:
+  mosquitto_log:
