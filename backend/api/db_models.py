@@ -19,6 +19,11 @@ from sqlalchemy.orm import declarative_base, relationship
 Base = declarative_base()
 
 
+def _enum(enum_cls):
+    # Store the lowercase values the SQL schema defines, not the member names.
+    return Enum(enum_cls, values_callable=lambda cls: [member.value for member in cls])
+
+
 class DeviceTypeEnum(str, enum.Enum):
     RFID = "rfid"
     PIR = "pir"
@@ -51,7 +56,7 @@ class User(Base):
     username = Column(String(64), unique=True, nullable=False, index=True)
     email = Column(String(120), unique=True, nullable=True)
     password_hash = Column(String(255), nullable=False)
-    role = Column(Enum(UserRoleEnum), default=UserRoleEnum.VIEWER, nullable=False)
+    role = Column(_enum(UserRoleEnum), default=UserRoleEnum.VIEWER, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -76,8 +81,8 @@ class UserDevice(Base):
 
     device_id = Column(String(50), primary_key=True)
     cluster_ID = Column(Integer, nullable=False, index=True)
-    device_type = Column(Enum(DeviceTypeEnum), nullable=False, default=DeviceTypeEnum.UNIVERSAL)
-    direction = Column(Enum(DirectionEnum), nullable=False, default=DirectionEnum.ENTRY)
+    device_type = Column(_enum(DeviceTypeEnum), nullable=False, default=DeviceTypeEnum.UNIVERSAL)
+    direction = Column(_enum(DirectionEnum), nullable=False, default=DirectionEnum.ENTRY)
     room_value = Column(String(50), nullable=False, index=True)
     location_description = Column(String(200))
     has_rfid = Column(Boolean, default=False)
@@ -87,7 +92,7 @@ class UserDevice(Base):
     firmware_version = Column(String(20))
     ip_address = Column(String(45))
     last_seen = Column(DateTime)
-    status = Column(Enum(DeviceStatusEnum), default=DeviceStatusEnum.ACTIVE)
+    status = Column(_enum(DeviceStatusEnum), default=DeviceStatusEnum.ACTIVE)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     sensor_data = relationship("SensorData", back_populates="device")
