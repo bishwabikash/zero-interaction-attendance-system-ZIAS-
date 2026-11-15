@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: arduino/setup-arduino-cli@v1
+      - uses: arduino/setup-arduino-cli@v2
       - name: Install ESP32 core + libraries
         run: |
           arduino-cli config init
