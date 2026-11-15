@@ -1,6 +1,7 @@
 import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '/';
+const LOGIN_PATH = '/api/v1/auth/login';
 
 const api = axios.create({
     baseURL: API_BASE_URL,
@@ -18,7 +19,8 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
 api.interceptors.response.use(
     (response) => response,
     (error: AxiosError) => {
-        if (error.response?.status === 401) {
+        // A rejected login is shown by the login form; only other 401s end the session.
+        if (error.response?.status === 401 && error.config?.url !== LOGIN_PATH) {
             localStorage.removeItem('zias.token');
             if (window.location.pathname !== '/login') {
                 window.location.href = '/login';
@@ -30,7 +32,7 @@ api.interceptors.response.use(
 
 export const authAPI = {
     login: (username: string, password: string) =>
-        api.post('/api/v1/auth/login', { username, password }),
+        api.post(LOGIN_PATH, { username, password }),
     me: () => api.get('/api/v1/auth/me'),
 };
 
