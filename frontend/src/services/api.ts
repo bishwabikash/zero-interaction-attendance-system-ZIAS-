@@ -1,48 +1,63 @@
-import axios from 'axios';
+import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_URL || '/';
 
 const api = axios.create({
     baseURL: API_BASE_URL,
-    headers: {
-        'Content-Type': 'application/json',
-    },
+    headers: { 'Content-Type': 'application/json' },
 });
 
-// Add auth token to requests
-api.interceptors.request.use((config: any) => {
-    const token = localStorage.getItem('token');
+api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+    const token = localStorage.getItem('zias.token');
     if (token) {
         config.headers.Authorization = `Bearer ${token}`;
     }
     return config;
 });
 
-// API methods
+api.interceptors.response.use(
+    (response) => response,
+    (error: AxiosError) => {
+        if (error.response?.status === 401) {
+            localStorage.removeItem('zias.token');
+            if (window.location.pathname !== '/login') {
+                window.location.href = '/login';
+            }
+        }
+        return Promise.reject(error);
+    },
+);
+
 export const authAPI = {
     login: (username: string, password: string) =>
         api.post('/api/v1/auth/login', { username, password }),
+    me: () => api.get('/api/v1/auth/me'),
 };
 
 export const attendanceAPI = {
-    getRecords: (params?: any) =>
+    getRecords: (params?: Record<string, unknown>) =>
         api.get('/api/v1/attendance/records', { params }),
     getRealtimeOccupancy: (room: string) =>
-        api.get(`/api/v1/attendance/realtime/${room}`),
+        api.get(`/api/v1/attendance/realtime/${encodeURIComponent(room)}`),
     getSummary: (studentId: string, month?: number, year?: number) =>
-        api.get(`/api/v1/attendance/summary/${studentId}`, { params: { month, year } }),
+        api.get(`/api/v1/attendance/summary/${encodeURIComponent(studentId)}`, {
+            params: { month, year },
+        }),
+    getStats: () => api.get('/api/v1/attendance/stats'),
 };
 
 export const devicesAPI = {
     list: () => api.get('/api/v1/devices'),
-    heartbeat: (deviceId: string, data: any) =>
-        api.post(`/api/v1/devices/${deviceId}/heartbeat`, data),
+    register: (data: Record<string, unknown>) =>
+        api.post('/api/v1/devices/register', data),
 };
 
 export const studentsAPI = {
-    list: () => api.get('/api/v1/students'),
-    get: (id: string) => api.get(`/api/v1/students/${id}`),
-    create: (data: any) => api.post('/api/v1/students', data),
+    list: (params?: Record<string, unknown>) =>
+        api.get('/api/v1/students', { params }),
+    get: (id: string) => api.get(`/api/v1/students/${encodeURIComponent(id)}`),
+    create: (data: Record<string, unknown>) =>
+        api.post('/api/v1/students', data),
 };
 
 export default api;

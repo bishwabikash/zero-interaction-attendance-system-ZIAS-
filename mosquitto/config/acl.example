@@ -1,0 +1,23 @@
+# ZIAS Mosquitto ACL — least privilege.
+# Copy to `acl` (no extension) and edit for your users.
+
+# Backend service — full read/write access to everything under zias/.
+user zias-backend
+topic readwrite zias/#
+
+# Each ESP32 node has its own MQTT user (see mosquitto/setup.sh).
+# Give it publish rights only on its own device topics and subscribe on cmd.
+# Replace ${device} with the actual DEVICE_NAME.
+# user room101_door_in
+# topic write zias/devices/room101_door_in/sensor
+# topic write zias/devices/room101_door_in/status
+# topic read  zias/devices/room101_door_in/cmd
+
+# Pattern-based ACL for auto-provisioned nodes — a client's username must
+# match the device_id it wants to publish for.
+pattern write zias/devices/%u/sensor
+pattern write zias/devices/%u/status
+pattern read  zias/devices/%u/cmd
+
+# Mobile app users publish beacon events under their student id.
+pattern write zias/mobile/%u/beacon
