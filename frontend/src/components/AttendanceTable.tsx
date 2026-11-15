@@ -17,22 +17,26 @@ export const AttendanceTable = () => {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
 
-    const fetchRecords = async () => {
-        try {
-            const response = await attendanceAPI.getRecords({ limit: 50 });
-            setRecords(response.data.records ?? []);
-            setError(null);
-        } catch (err) {
-            setError('Could not load attendance records');
-        } finally {
-            setLoading(false);
-        }
-    };
-
     useEffect(() => {
-        fetchRecords();
+        let active = true;
+        const fetchRecords = async () => {
+            try {
+                const response = await attendanceAPI.getRecords({ limit: 50 });
+                if (!active) return;
+                setRecords(response.data.records ?? []);
+                setError(null);
+            } catch {
+                if (active) setError('Could not load attendance records');
+            } finally {
+                if (active) setLoading(false);
+            }
+        };
+        void fetchRecords();
         const timer = setInterval(fetchRecords, 30_000);
-        return () => clearInterval(timer);
+        return () => {
+            active = false;
+            clearInterval(timer);
+        };
     }, []);
 
     if (loading) {

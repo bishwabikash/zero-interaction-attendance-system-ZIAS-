@@ -18,21 +18,24 @@ export const DeviceList = () => {
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
-        fetchDevices();
+        let active = true;
+        const fetchDevices = async () => {
+            try {
+                const response = await devicesAPI.list();
+                if (active) setDevices(response.data.devices || []);
+            } catch (error) {
+                console.error('Failed to fetch devices:', error);
+            } finally {
+                if (active) setLoading(false);
+            }
+        };
+        void fetchDevices();
         const interval = setInterval(fetchDevices, 10000); // Refresh every 10s
-        return () => clearInterval(interval);
+        return () => {
+            active = false;
+            clearInterval(interval);
+        };
     }, []);
-
-    const fetchDevices = async () => {
-        try {
-            const response = await devicesAPI.list();
-            setDevices(response.data.devices || []);
-        } catch (error) {
-            console.error('Failed to fetch devices:', error);
-        } finally {
-            setLoading(false);
-        }
-    };
 
     const getStatusColor = (status: string) => {
         switch (status) {
