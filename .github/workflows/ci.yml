@@ -54,9 +54,16 @@ jobs:
       - name: Compile
         run: arduino-cli compile --fqbn esp32:esp32:esp32 hardware/esp32_universal
 
+  backend-image:
+    name: Backend (docker build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build ./backend
+
   dependabot-automerge:
     name: Dependabot auto-merge
-    needs: [backend, frontend, esp32]
+    needs: [backend, frontend, esp32, backend-image]
     if: github.event_name == 'pull_request' && github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
@@ -68,9 +75,10 @@ jobs:
         uses: dependabot/fetch-metadata@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Merge patch and minor updates
-        if: steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-            steps.meta.outputs.update-type == 'version-update:semver-minor'
+      - name: Merge patch and minor updates (pip, npm, GitHub Actions only)
+        if: contains(fromJSON('["pip","npm_and_yarn","github_actions"]'), steps.meta.outputs.package-ecosystem) &&
+            (steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+            steps.meta.outputs.update-type == 'version-update:semver-minor')
         run: gh pr merge --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
