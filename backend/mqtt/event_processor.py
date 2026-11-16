@@ -192,11 +192,11 @@ class EventProcessor:
         if self.pubsub:
             try:
                 await self.pubsub.unsubscribe("zias:events")
-                await self.pubsub.close()
+                await self.pubsub.aclose()
             except Exception:
                 pass
         if self.redis_client:
-            await self.redis_client.close()
+            await self.redis_client.aclose()
 
 
 async def _main() -> None:

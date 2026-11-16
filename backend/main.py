@@ -45,7 +45,7 @@ async def _ws_broadcaster():
     finally:
         try:
             await pubsub.unsubscribe("zias:events")
-            await pubsub.close()
+            await pubsub.aclose()
         except Exception:
             pass
 
