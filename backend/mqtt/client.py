@@ -141,7 +141,7 @@ class MQTTClient:
         try:
             await self._redis.publish("zias:events", payload)
             key = f"zias:state:{event.get('device_id') or event.get('student_id') or 'unknown'}"
-            await self._redis.setex(key, settings.ATTENDANCE_WINDOW_SECONDS, payload)
+            await self._redis.set(key, payload, ex=settings.ATTENDANCE_WINDOW_SECONDS)
         except Exception as exc:
             print(f"[mqtt] redis publish failed: {exc}")
 
