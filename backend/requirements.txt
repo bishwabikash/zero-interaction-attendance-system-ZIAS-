@@ -10,6 +10,6 @@ mysql-connector-python==26.10.0
 python-dotenv==1.2.4
 redis==8.1.0
 paho-mqtt==2.2.0
-sqlalchemy==2.1.8
+sqlalchemy==2.1.9
 alembic==1.20.1
 websockets==17.4
